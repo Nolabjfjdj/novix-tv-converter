@@ -164,18 +164,49 @@ async function runConversion(jobId, key, filename) {
     if (!source.Body) throw new Error('Filebase returned an empty file stream.');
     await pipeline(source.Body, createWriteStream(inputPath));
 
-    job.message = 'Analyse de la vidéo...';
+    job.message = 'Analyse des codecs vidéo et audio...';
     console.log('[Conversion ' + jobId + '] Probing source video');
-    const durationText = await runProcess('ffprobe', [
+    const probeText = await runProcess('ffprobe', [
       '-v', 'error',
-      '-show_entries', 'format=duration',
-      '-of', 'default=noprint_wrappers=1:nokey=1',
+      '-show_entries', 'format=duration,format_name:stream=codec_type,codec_name,pix_fmt',
+      '-of', 'json',
       inputPath
     ]);
-    const duration = Number(durationText);
+    const probe = JSON.parse(probeText);
+    const duration = Number(probe.format?.duration);
+    const formatNames = String(probe.format?.format_name || '').split(',');
+    const videoStream = (probe.streams || []).find(stream => stream.codec_type === 'video');
+    const audioStreams = (probe.streams || []).filter(stream => stream.codec_type === 'audio');
 
     if (!Number.isFinite(duration) || duration <= 0) {
       throw new Error('Could not determine the video duration.');
+    }
+    if (!videoStream) {
+      throw new Error('No video stream was found in the uploaded file.');
+    }
+
+    const hasMp4Extension = /\\.(mp4|m4v)$/i.test(key);
+    const isMp4Container = formatNames.includes('mov') && formatNames.includes('mp4');
+    const hasBrowserCompatibleCodecs =
+      videoStream.codec_name === 'h264' &&
+      videoStream.pix_fmt === 'yuv420p' &&
+      audioStreams.every(stream => stream.codec_name === 'aac');
+    const canUseOriginal = hasMp4Extension && isMp4Container && hasBrowserCompatibleCodecs;
+
+    if (canUseOriginal) {
+      jobs.set(jobId, {
+        status: 'completed',
+        message: 'Vidéo déjà compatible H.264/AAC : aucune conversion nécessaire.',
+        progress: { stage: 'completed', percent: 100 },
+        key,
+        contentType: 'video/mp4',
+        size: sourceLength,
+        duration,
+        passthrough: true,
+        finishedAt: new Date().toISOString()
+      });
+      console.log('[Conversion ' + jobId + '] Source already browser-compatible; keeping original:', key);
+      return;
     }
 
     job.message = 'Conversion vidéo en H.264/AAC...';
@@ -241,6 +272,7 @@ async function runConversion(jobId, key, filename) {
       contentType: 'video/mp4',
       size: outputStat.size,
       duration,
+      passthrough: false,
       finishedAt: new Date().toISOString()
     });
     console.log('[Conversion ' + jobId + '] Completed:', outputKey);
