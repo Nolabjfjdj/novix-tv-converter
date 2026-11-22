@@ -59,10 +59,16 @@ function runFfmpeg(args, jobId, job, duration) {
     let stdoutBuffer = '';
     let lastLoggedPercent = -1;
     let lastLogAt = Date.now();
+    const startedAt = Date.now();
+    const heartbeat = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+      const percent = job.progress?.percent ?? 0;
+      console.log('[Conversion ' + jobId + '] FFmpeg still running: ' + elapsed + 's elapsed, ' + percent + '% reported');
+    }, 30000);
 
     child.stdout.on('data', chunk => {
       stdoutBuffer += chunk.toString();
-      const lines = stdoutBuffer.split(/\\r?\\n/);
+      const lines = stdoutBuffer.split(/\r?\n/);
       stdoutBuffer = lines.pop() || '';
 
       for (const line of lines) {
@@ -71,7 +77,7 @@ function runFfmpeg(args, jobId, job, duration) {
         const name = line.slice(0, separator);
         const value = line.slice(separator + 1);
 
-        if (name === 'out_time_ms') {
+        if (name === 'out_time_us' || name === 'out_time_ms') {
           const encodedSeconds = Number(value) / 1000000;
           if (Number.isFinite(encodedSeconds) && duration > 0) {
             const percent = Math.min(99, Math.max(0, Math.floor(encodedSeconds / duration * 100)));
@@ -105,8 +111,9 @@ function runFfmpeg(args, jobId, job, duration) {
       if (stderr.length > 12000) stderr = stderr.slice(-12000);
     });
 
-    child.once('error', reject);
+    child.once('error', error => { clearInterval(heartbeat); reject(error); });
     child.once('close', code => {
+      clearInterval(heartbeat);
       if (code === 0) {
         console.log('[Conversion ' + jobId + '] Encoding finished');
         resolve();
