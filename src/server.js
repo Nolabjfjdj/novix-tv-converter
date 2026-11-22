@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { createWriteStream } from 'node:fs';
+import { createReadStream, createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
@@ -162,7 +162,7 @@ app.post('/convert', async (req, res) => {
     return res.json({
       status: 'completed',
       key: outputKey,
-      contentType: 'video/mp4',\n      storageContentType: 'application/octet-stream',
+      contentType: 'video/mp4',
       size: outputStat.size,
       duration
     });
