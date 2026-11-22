@@ -1,6 +1,6 @@
 # NOVIX TV Converter
 
-Private-purpose conversion API for NOVIX TV. The service downloads an existing video object from Filebase, converts it to MP4 H.264/AAC with FFmpeg, and uploads the converted file back to Filebase.
+Private-purpose conversion API for NOVIX TV. The service downloads an existing video object from Filebase, converts it to MP4 H.264/AAC with FFmpeg, and uploads the converted bytes back to Filebase as an application/octet-stream .bin object. This avoids labeling the upload as a video at storage time, which matters for this account's 25 MB video-upload restriction. The main NOVIX TV backend must sign playback downloads with ResponseContentType set to video/mp4.
 
 ## Deploy on Render
 
@@ -46,14 +46,14 @@ Successful response:
 ```json
 {
   "status": "completed",
-  "key": "videos/converted/<generated-name>.mp4",
+  "key": "videos/converted/<generated-name>.bin",
   "contentType": "video/mp4",
   "size": 123456,
   "duration": 123.45
 }
 ```
 
-The API accepts object keys, not public URLs or uploaded file bodies. Keep all credentials in Render environment variables, never in this repository.
+The API accepts object keys, not public URLs or uploaded file bodies. The returned key points to binary MP4 data stored as application/octet-stream. When generating the signed playback URL, the main backend must set the GetObject response override ResponseContentType to video/mp4. Keep all credentials in Render environment variables, never in this repository.
 
 ## Resource note
 
