@@ -1,0 +1,180 @@
+import express from 'express';
+import { randomUUID } from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
+import fs from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import { spawn } from 'node:child_process';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
+
+const app = express();
+app.disable('x-powered-by');
+app.use(express.json({ limit: '64kb' }));
+
+const port = Number(process.env.PORT || 10000);
+const bucket = process.env.FILEBASE_BUCKET;
+const endpoint = process.env.FILEBASE_ENDPOINT || 'https://s3.filebase.io';
+const region = process.env.FILEBASE_REGION || 'us-east-1';
+const accessKeyId = process.env.FILEBASE_ACCESS_KEY_ID;
+const secretAccessKey = process.env.FILEBASE_SECRET_ACCESS_KEY;
+const apiToken = process.env.CONVERTER_API_TOKEN;
+const maxInputBytes = Number(process.env.MAX_INPUT_BYTES || 2147483648);
+
+const storage = new S3Client({
+  endpoint,
+  region,
+  credentials: accessKeyId && secretAccessKey ? { accessKeyId, secretAccessKey } : undefined
+});
+
+let conversionRunning = false;
+
+function runProcess(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk.toString(); });
+    child.stderr.on('data', chunk => {
+      stderr += chunk.toString();
+      if (stderr.length > 12000) stderr = stderr.slice(-12000);
+    });
+    child.once('error', reject);
+    child.once('close', code => {
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error((stderr.trim() || command + ' failed').slice(-3000)));
+    });
+  });
+}
+
+function safeFilename(value) {
+  const base = path.basename(String(value || 'video')).replace(/[^a-zA-Z0-9._-]/g, '_');
+  return base.replace(/\.[^.]+$/, '').slice(0, 100) || 'video';
+}
+
+function assertConfigured() {
+  const missing = [];
+  if (!bucket) missing.push('FILEBASE_BUCKET');
+  if (!accessKeyId) missing.push('FILEBASE_ACCESS_KEY_ID');
+  if (!secretAccessKey) missing.push('FILEBASE_SECRET_ACCESS_KEY');
+  if (!apiToken) missing.push('CONVERTER_API_TOKEN');
+  if (missing.length) throw new Error('Missing environment variables: ' + missing.join(', '));
+}
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', service: 'novix-tv-converter' });
+});
+
+app.post('/convert', async (req, res) => {
+  if (!apiToken || req.get('authorization') !== 'Bearer ' + apiToken) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  if (conversionRunning) {
+    return res.status(429).json({ error: 'A conversion is already running. Retry shortly.' });
+  }
+
+  const key = typeof req.body?.key === 'string' ? req.body.key : '';
+  const filename = safeFilename(req.body?.filename);
+
+  if (!key || key.startsWith('/') || key.split('/').includes('..')) {
+    return res.status(400).json({ error: 'Invalid source key.' });
+  }
+
+  try {
+    assertConfigured();
+  } catch (error) {
+    return res.status(503).json({ error: error.message });
+  }
+
+  conversionRunning = true;
+  let workdir;
+
+  try {
+    workdir = await fs.mkdtemp(path.join(os.tmpdir(), 'novix-convert-'));
+    const inputPath = path.join(workdir, 'input');
+    const outputPath = path.join(workdir, 'output.mp4');
+
+    const source = await storage.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const sourceLength = Number(source.ContentLength || 0);
+
+    if (sourceLength > maxInputBytes) {
+      source.Body?.destroy();
+      return res.status(413).json({ error: 'Source video exceeds the configured size limit.' });
+    }
+
+    if (!source.Body) throw new Error('Filebase returned an empty file stream.');
+
+    await pipeline(source.Body, createWriteStream(inputPath));
+
+    const durationText = await runProcess('ffprobe', [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
+      inputPath
+    ]);
+    const duration = Number(durationText);
+
+    if (!Number.isFinite(duration) || duration <= 0) {
+      throw new Error('Could not determine the video duration.');
+    }
+
+    await runProcess('ffmpeg', [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-y',
+      '-i', inputPath,
+      '-map', '0:v:0',
+      '-map', '0:a?',
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-crf', '26',
+      '-pix_fmt', 'yuv420p',
+      '-threads', '1',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-ac', '2',
+      '-movflags', '+faststart',
+      outputPath
+    ]);
+
+    const outputStat = await fs.stat(outputPath);
+    if (!outputStat.size) throw new Error('FFmpeg produced an empty output file.');
+
+    const outputKey = 'videos/converted/' + randomUUID() + '-' + filename + '.mp4';
+    const upload = new Upload({
+      client: storage,
+      params: {
+        Bucket: bucket,
+        Key: outputKey,
+        Body: createReadStream(outputPath),
+        ContentLength: outputStat.size,
+        ContentType: 'video/mp4'
+      },
+      queueSize: 1,
+      partSize: 8 * 1024 * 1024,
+      leavePartsOnError: false
+    });
+
+    await upload.done();
+
+    return res.json({
+      status: 'completed',
+      key: outputKey,
+      contentType: 'video/mp4',
+      size: outputStat.size,
+      duration
+    });
+  } catch (error) {
+    console.error('Video conversion failed:', error);
+    return res.status(500).json({ error: 'Video conversion failed.', detail: String(error.message || error).slice(0, 1000) });
+  } finally {
+    if (workdir) await fs.rm(workdir, { recursive: true, force: true }).catch(() => {});
+    conversionRunning = false;
+  }
+});
+
+app.listen(port, '0.0.0.0', () => {
+  console.log('NOVIX TV Converter listening on port ' + port);
+});
