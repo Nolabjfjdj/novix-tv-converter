@@ -28,6 +28,7 @@ const storage = new S3Client({
   credentials: accessKeyId && secretAccessKey ? { accessKeyId, secretAccessKey } : undefined
 });
 
+const jobs = new Map();
 let conversionRunning = false;
 
 function runProcess(command, args) {
@@ -62,52 +63,34 @@ function assertConfigured() {
   if (missing.length) throw new Error('Missing environment variables: ' + missing.join(', '));
 }
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'novix-tv-converter' });
-});
+function authorized(req) {
+  return Boolean(apiToken && req.get('authorization') === 'Bearer ' + apiToken);
+}
 
-app.post('/convert', async (req, res) => {
-  if (!apiToken || req.get('authorization') !== 'Bearer ' + apiToken) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  if (conversionRunning) {
-    return res.status(429).json({ error: 'A conversion is already running. Retry shortly.' });
-  }
-
-  const key = typeof req.body?.key === 'string' ? req.body.key : '';
-  const filename = safeFilename(req.body?.filename);
-
-  if (!key || key.startsWith('/') || key.split('/').includes('..')) {
-    return res.status(400).json({ error: 'Invalid source key.' });
-  }
-
-  try {
-    assertConfigured();
-  } catch (error) {
-    return res.status(503).json({ error: error.message });
-  }
-
-  conversionRunning = true;
+async function runConversion(jobId, key, filename) {
   let workdir;
+  const job = jobs.get(jobId);
 
   try {
     workdir = await fs.mkdtemp(path.join(os.tmpdir(), 'novix-convert-'));
     const inputPath = path.join(workdir, 'input');
     const outputPath = path.join(workdir, 'output.mp4');
 
+    job.message = 'Téléchargement de la vidéo depuis Filebase...';
+    console.log('[Conversion ' + jobId + '] Downloading source:', key);
     const source = await storage.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     const sourceLength = Number(source.ContentLength || 0);
 
     if (sourceLength > maxInputBytes) {
       source.Body?.destroy();
-      return res.status(413).json({ error: 'Source video exceeds the configured size limit.' });
+      throw new Error('Source video exceeds the configured size limit.');
     }
 
     if (!source.Body) throw new Error('Filebase returned an empty file stream.');
-
     await pipeline(source.Body, createWriteStream(inputPath));
 
+    job.message = 'Analyse de la vidéo...';
+    console.log('[Conversion ' + jobId + '] Probing source video');
     const durationText = await runProcess('ffprobe', [
       '-v', 'error',
       '-show_entries', 'format=duration',
@@ -120,6 +103,8 @@ app.post('/convert', async (req, res) => {
       throw new Error('Could not determine the video duration.');
     }
 
+    job.message = 'Conversion vidéo en H.264/AAC...';
+    console.log('[Conversion ' + jobId + '] Encoding with FFmpeg');
     await runProcess('ffmpeg', [
       '-hide_banner',
       '-loglevel', 'error',
@@ -142,6 +127,8 @@ app.post('/convert', async (req, res) => {
     const outputStat = await fs.stat(outputPath);
     if (!outputStat.size) throw new Error('FFmpeg produced an empty output file.');
 
+    job.message = 'Envoi de la vidéo convertie vers Filebase...';
+    console.log('[Conversion ' + jobId + '] Uploading converted video:', outputStat.size, 'bytes');
     const outputKey = 'videos/converted/' + randomUUID() + '-' + filename + '.bin';
     const upload = new Upload({
       client: storage,
@@ -158,21 +145,67 @@ app.post('/convert', async (req, res) => {
     });
 
     await upload.done();
-
-    return res.json({
+    jobs.set(jobId, {
       status: 'completed',
+      message: 'Vidéo convertie et prête.',
       key: outputKey,
       contentType: 'video/mp4',
       size: outputStat.size,
-      duration
+      duration,
+      finishedAt: new Date().toISOString()
     });
+    console.log('[Conversion ' + jobId + '] Completed:', outputKey);
   } catch (error) {
-    console.error('Video conversion failed:', error);
-    return res.status(500).json({ error: 'Video conversion failed.', detail: String(error.message || error).slice(0, 1000) });
+    console.error('[Conversion ' + jobId + '] Failed:', error);
+    jobs.set(jobId, {
+      status: 'failed',
+      message: String(error.message || error).slice(0, 1000),
+      finishedAt: new Date().toISOString()
+    });
   } finally {
     if (workdir) await fs.rm(workdir, { recursive: true, force: true }).catch(() => {});
     conversionRunning = false;
   }
+}
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', service: 'novix-tv-converter' });
+});
+
+app.post('/convert', (req, res) => {
+  if (!authorized(req)) return res.status(401).json({ error: 'Unauthorized' });
+  if (conversionRunning) return res.status(429).json({ error: 'A conversion is already running. Retry shortly.' });
+
+  const key = typeof req.body?.key === 'string' ? req.body.key : '';
+  const filename = safeFilename(req.body?.filename);
+
+  if (!key || key.startsWith('/') || key.split('/').includes('..')) {
+    return res.status(400).json({ error: 'Invalid source key.' });
+  }
+
+  try {
+    assertConfigured();
+  } catch (error) {
+    return res.status(503).json({ error: error.message });
+  }
+
+  const jobId = randomUUID();
+  jobs.set(jobId, {
+    status: 'processing',
+    message: 'Préparation de la conversion...',
+    createdAt: new Date().toISOString()
+  });
+  conversionRunning = true;
+  console.log('[Conversion ' + jobId + '] Job accepted');
+  runConversion(jobId, key, filename);
+  res.status(202).json({ jobId, status: 'processing' });
+});
+
+app.get('/convert/:jobId', (req, res) => {
+  if (!authorized(req)) return res.status(401).json({ error: 'Unauthorized' });
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Conversion job not found.' });
+  res.json(job);
 });
 
 app.listen(port, '0.0.0.0', () => {
