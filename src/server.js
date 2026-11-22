@@ -142,7 +142,7 @@ app.post('/convert', async (req, res) => {
     const outputStat = await fs.stat(outputPath);
     if (!outputStat.size) throw new Error('FFmpeg produced an empty output file.');
 
-    const outputKey = 'videos/converted/' + randomUUID() + '-' + filename + '.mp4';
+    const outputKey = 'videos/converted/' + randomUUID() + '-' + filename + '.bin';
     const upload = new Upload({
       client: storage,
       params: {
@@ -150,7 +150,7 @@ app.post('/convert', async (req, res) => {
         Key: outputKey,
         Body: createReadStream(outputPath),
         ContentLength: outputStat.size,
-        ContentType: 'video/mp4'
+        ContentType: 'application/octet-stream'
       },
       queueSize: 1,
       partSize: 8 * 1024 * 1024,
@@ -162,7 +162,7 @@ app.post('/convert', async (req, res) => {
     return res.json({
       status: 'completed',
       key: outputKey,
-      contentType: 'video/mp4',
+      contentType: 'video/mp4',\n      storageContentType: 'application/octet-stream',
       size: outputStat.size,
       duration
     });
