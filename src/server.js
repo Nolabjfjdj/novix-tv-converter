@@ -194,18 +194,48 @@ async function runConversion(jobId, key, filename) {
     const canUseOriginal = hasMp4Extension && isMp4Container && hasBrowserCompatibleCodecs;
 
     if (canUseOriginal) {
+      const outputKey = 'videos/converted/' + randomUUID() + '-' + filename + '.bin';
+      const inputStat = await fs.stat(inputPath);
+      job.message = 'Vidéo compatible : préparation du fichier sans réencodage...';
+      job.progress = { stage: 'uploading', percent: 0, uploadedBytes: 0, totalBytes: inputStat.size };
+      console.log('[Conversion ' + jobId + '] Source already browser-compatible; copying without re-encoding:', key);
+      const upload = new Upload({
+        client: storage,
+        params: {
+          Bucket: bucket,
+          Key: outputKey,
+          Body: createReadStream(inputPath),
+          ContentLength: inputStat.size,
+          ContentType: 'application/octet-stream'
+        },
+        queueSize: 3,
+        partSize: 8 * 1024 * 1024,
+        leavePartsOnError: false
+      });
+      upload.on('httpUploadProgress', progress => {
+        const loaded = Number(progress.loaded || 0);
+        const total = Number(progress.total || inputStat.size);
+        job.progress = {
+          stage: 'uploading',
+          percent: Math.min(100, Math.floor(loaded / total * 100)),
+          uploadedBytes: loaded,
+          totalBytes: total
+        };
+      });
+      await upload.done();
       jobs.set(jobId, {
         status: 'completed',
-        message: 'Vidéo déjà compatible H.264/AAC : aucune conversion nécessaire.',
+        message: 'Vidéo compatible : fichier prêt sans réencodage.',
         progress: { stage: 'completed', percent: 100 },
-        key,
+        key: outputKey,
+        sourceKey: key,
         contentType: 'video/mp4',
-        size: sourceLength,
+        size: inputStat.size,
         duration,
         passthrough: true,
         finishedAt: new Date().toISOString()
       });
-      console.log('[Conversion ' + jobId + '] Source already browser-compatible; keeping original:', key);
+      console.log('[Conversion ' + jobId + '] Compatible video copied to playlist format:', outputKey);
       return;
     }
 
