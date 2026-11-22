@@ -52,7 +52,7 @@ function runProcess(command, args) {
 
 function runFfmpeg(args, jobId, job, duration) {
   return new Promise((resolve, reject) => {
-    const child = spawn('ffmpeg', [...args, '-progress', 'pipe:1', '-nostats'], {
+    const child = spawn('ffmpeg', [...args.slice(0, -1), '-progress', 'pipe:1', '-nostats', args[args.length - 1]], {
       stdio: ['ignore', 'pipe', 'pipe']
     });
     let stderr = '';
