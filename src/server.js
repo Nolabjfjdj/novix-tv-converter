@@ -49,6 +49,74 @@ function runProcess(command, args) {
   });
 }
 
+
+function runFfmpeg(args, jobId, job, duration) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('ffmpeg', [...args, '-progress', 'pipe:1', '-nostats'], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let stderr = '';
+    let stdoutBuffer = '';
+    let lastLoggedPercent = -1;
+    let lastLogAt = Date.now();
+
+    child.stdout.on('data', chunk => {
+      stdoutBuffer += chunk.toString();
+      const lines = stdoutBuffer.split(/\\r?\\n/);
+      stdoutBuffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const separator = line.indexOf('=');
+        if (separator < 0) continue;
+        const name = line.slice(0, separator);
+        const value = line.slice(separator + 1);
+
+        if (name === 'out_time_ms') {
+          const encodedSeconds = Number(value) / 1000000;
+          if (Number.isFinite(encodedSeconds) && duration > 0) {
+            const percent = Math.min(99, Math.max(0, Math.floor(encodedSeconds / duration * 100)));
+            job.progress = {
+              stage: 'encoding',
+              percent,
+              elapsedSeconds: Math.floor(encodedSeconds),
+              totalSeconds: Math.ceil(duration)
+            };
+            if (percent >= lastLoggedPercent + 5 || Date.now() - lastLogAt >= 15000) {
+              console.log('[Conversion ' + jobId + '] Encoding progress: ' + percent + '% (' + Math.floor(encodedSeconds) + '/' + Math.ceil(duration) + 's)');
+              lastLoggedPercent = percent;
+              lastLogAt = Date.now();
+            }
+          }
+        } else if (name === 'speed') {
+          job.progress = { ...(job.progress || {}), speed: value };
+        } else if (name === 'progress' && value === 'end') {
+          job.progress = {
+            stage: 'encoding',
+            percent: 100,
+            elapsedSeconds: Math.ceil(duration),
+            totalSeconds: Math.ceil(duration)
+          };
+        }
+      }
+    });
+
+    child.stderr.on('data', chunk => {
+      stderr += chunk.toString();
+      if (stderr.length > 12000) stderr = stderr.slice(-12000);
+    });
+
+    child.once('error', reject);
+    child.once('close', code => {
+      if (code === 0) {
+        console.log('[Conversion ' + jobId + '] Encoding finished');
+        resolve();
+      } else {
+        reject(new Error((stderr.trim() || 'ffmpeg failed').slice(-3000)));
+      }
+    });
+  });
+}
+
 function safeFilename(value) {
   const base = path.basename(String(value || 'video')).replace(/[^a-zA-Z0-9._-]/g, '_');
   return base.replace(/\.[^.]+$/, '').slice(0, 100) || 'video';
@@ -104,8 +172,9 @@ async function runConversion(jobId, key, filename) {
     }
 
     job.message = 'Conversion vidéo en H.264/AAC...';
+    job.progress = { stage: 'encoding', percent: 0, elapsedSeconds: 0, totalSeconds: Math.ceil(duration) };
     console.log('[Conversion ' + jobId + '] Encoding with FFmpeg');
-    await runProcess('ffmpeg', [
+    await runFfmpeg([
       '-hide_banner',
       '-loglevel', 'error',
       '-y',
@@ -122,7 +191,7 @@ async function runConversion(jobId, key, filename) {
       '-ac', '2',
       '-movflags', '+faststart',
       outputPath
-    ]);
+    ], jobId, job, duration);
 
     const outputStat = await fs.stat(outputPath);
     if (!outputStat.size) throw new Error('FFmpeg produced an empty output file.');
@@ -130,6 +199,7 @@ async function runConversion(jobId, key, filename) {
     job.message = 'Envoi de la vidéo convertie vers Filebase...';
     console.log('[Conversion ' + jobId + '] Uploading converted video:', outputStat.size, 'bytes');
     const outputKey = 'videos/converted/' + randomUUID() + '-' + filename + '.bin';
+    job.progress = { stage: 'uploading', percent: 0, uploadedBytes: 0, totalBytes: outputStat.size };
     const upload = new Upload({
       client: storage,
       params: {
@@ -144,10 +214,22 @@ async function runConversion(jobId, key, filename) {
       leavePartsOnError: false
     });
 
+    let lastUploadLog = 0;
+    upload.on('httpUploadProgress', progress => {
+      const loaded = Number(progress.loaded || 0);
+      const total = Number(progress.total || outputStat.size);
+      const percent = Math.min(100, Math.floor(loaded / total * 100));
+      job.progress = { stage: 'uploading', percent, uploadedBytes: loaded, totalBytes: total };
+      if (percent >= lastUploadLog + 10 || percent === 100) {
+        console.log('[Conversion ' + jobId + '] Upload progress: ' + percent + '%');
+        lastUploadLog = percent;
+      }
+    });
     await upload.done();
     jobs.set(jobId, {
       status: 'completed',
       message: 'Vidéo convertie et prête.',
+      progress: { stage: 'completed', percent: 100 },
       key: outputKey,
       contentType: 'video/mp4',
       size: outputStat.size,
