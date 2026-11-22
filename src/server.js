@@ -192,7 +192,7 @@ async function runConversion(jobId, key, filename) {
       '-preset', 'ultrafast',
       '-crf', '26',
       '-pix_fmt', 'yuv420p',
-      '-threads', '1',
+      '-threads', '0',
       '-c:a', 'aac',
       '-b:a', '128k',
       '-ac', '2',
@@ -216,7 +216,7 @@ async function runConversion(jobId, key, filename) {
         ContentLength: outputStat.size,
         ContentType: 'application/octet-stream'
       },
-      queueSize: 1,
+      queueSize: 3,
       partSize: 8 * 1024 * 1024,
       leavePartsOnError: false
     });
