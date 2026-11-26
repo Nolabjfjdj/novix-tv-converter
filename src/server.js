@@ -185,13 +185,12 @@ async function runConversion(jobId, key, filename) {
       throw new Error('No video stream was found in the uploaded file.');
     }
 
-    const hasMp4Extension = /\.(mp4|m4v)$/i.test(key);
     const isMp4Container = formatNames.includes('mov') && formatNames.includes('mp4');
     const hasBrowserCompatibleCodecs =
       videoStream.codec_name === 'h264' &&
       videoStream.pix_fmt === 'yuv420p' &&
       audioStreams.every(stream => stream.codec_name === 'aac');
-    const canUseOriginal = hasMp4Extension && isMp4Container && hasBrowserCompatibleCodecs;
+    const canUseOriginal = isMp4Container && hasBrowserCompatibleCodecs;
 
     if (canUseOriginal) {
       const outputKey = 'videos/converted/' + randomUUID() + '-' + filename + '.bin';
