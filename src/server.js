@@ -28,11 +28,6 @@ const storageProviders = [createStorageProvider('filebase', ''), createStoragePr
 function getStorageProvider(id) { return storageProviders.find(provider => provider.id === id) || null; }
 const maxInputBytes = Number(process.env.MAX_INPUT_BYTES || 2147483648);
 
-const storage = new S3Client({
-  endpoint,
-  region,
-  credentials: accessKeyId && secretAccessKey ? { accessKeyId, secretAccessKey } : undefined
-});
 
 const jobs = new Map();
 let conversionRunning = false;
