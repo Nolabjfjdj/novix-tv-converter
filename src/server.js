@@ -14,12 +14,18 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '64kb' }));
 
 const port = Number(process.env.PORT || 10000);
-const bucket = process.env.FILEBASE_BUCKET;
-const endpoint = process.env.FILEBASE_ENDPOINT || 'https://s3.filebase.io';
-const region = process.env.FILEBASE_REGION || 'us-east-1';
-const accessKeyId = process.env.FILEBASE_ACCESS_KEY_ID;
-const secretAccessKey = process.env.FILEBASE_SECRET_ACCESS_KEY;
 const apiToken = process.env.CONVERTER_API_TOKEN;
+function createStorageProvider(id, suffix) {
+  const bucket = process.env['FILEBASE_BUCKET' + suffix];
+  const accessKeyId = process.env['FILEBASE_ACCESS_KEY_ID' + suffix];
+  const secretAccessKey = process.env['FILEBASE_SECRET_ACCESS_KEY' + suffix];
+  if (!bucket || !accessKeyId || !secretAccessKey) return null;
+  const endpoint = process.env['FILEBASE_ENDPOINT' + suffix] || 'https://s3.filebase.io';
+  const region = process.env['FILEBASE_REGION' + suffix] || 'us-east-1';
+  return { id, bucket, client: new S3Client({ endpoint, region, credentials: { accessKeyId, secretAccessKey } }) };
+}
+const storageProviders = [createStorageProvider('filebase', ''), createStorageProvider('filebase1', '1')].filter(Boolean);
+function getStorageProvider(id) { return storageProviders.find(provider => provider.id === id) || null; }
 const maxInputBytes = Number(process.env.MAX_INPUT_BYTES || 2147483648);
 
 const storage = new S3Client({
@@ -129,22 +135,20 @@ function safeFilename(value) {
   return base.replace(/\.[^.]+$/, '').slice(0, 100) || 'video';
 }
 
-function assertConfigured() {
-  const missing = [];
-  if (!bucket) missing.push('FILEBASE_BUCKET');
-  if (!accessKeyId) missing.push('FILEBASE_ACCESS_KEY_ID');
-  if (!secretAccessKey) missing.push('FILEBASE_SECRET_ACCESS_KEY');
-  if (!apiToken) missing.push('CONVERTER_API_TOKEN');
-  if (missing.length) throw new Error('Missing environment variables: ' + missing.join(', '));
+function assertConfigured(providerId) {
+  if (!getStorageProvider(providerId)) throw new Error('Storage provider is not configured: ' + providerId);
+  if (!apiToken) throw new Error('Missing environment variable: CONVERTER_API_TOKEN');
 }
 
 function authorized(req) {
   return Boolean(apiToken && req.get('authorization') === 'Bearer ' + apiToken);
 }
 
-async function runConversion(jobId, key, filename) {
+async function runConversion(jobId, key, filename, providerId) {
   let workdir;
   const job = jobs.get(jobId);
+  const provider = getStorageProvider(providerId);
+  if (!provider) throw new Error('Storage provider is not configured.');
 
   try {
     workdir = await fs.mkdtemp(path.join(os.tmpdir(), 'novix-convert-'));
@@ -153,7 +157,7 @@ async function runConversion(jobId, key, filename) {
 
     job.message = 'Téléchargement de la vidéo depuis Filebase...';
     console.log('[Conversion ' + jobId + '] Downloading source:', key);
-    const source = await storage.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const source = await provider.client.send(new GetObjectCommand({ Bucket: provider.bucket, Key: key }));
     const sourceLength = Number(source.ContentLength || 0);
 
     if (sourceLength > maxInputBytes) {
@@ -199,9 +203,9 @@ async function runConversion(jobId, key, filename) {
       job.progress = { stage: 'uploading', percent: 0, uploadedBytes: 0, totalBytes: inputStat.size };
       console.log('[Conversion ' + jobId + '] Source already browser-compatible; copying without re-encoding:', key);
       const upload = new Upload({
-        client: storage,
+        client: provider.client,
         params: {
-          Bucket: bucket,
+          Bucket: provider.bucket,
           Key: outputKey,
           Body: createReadStream(inputPath),
           ContentLength: inputStat.size,
@@ -232,6 +236,7 @@ async function runConversion(jobId, key, filename) {
         size: inputStat.size,
         duration,
         passthrough: true,
+        storageProvider: provider.id,
         finishedAt: new Date().toISOString()
       });
       console.log('[Conversion ' + jobId + '] Compatible video copied to playlist format:', outputKey);
@@ -268,9 +273,9 @@ async function runConversion(jobId, key, filename) {
     const outputKey = 'videos/converted/' + randomUUID() + '-' + filename + '.bin';
     job.progress = { stage: 'uploading', percent: 0, uploadedBytes: 0, totalBytes: outputStat.size };
     const upload = new Upload({
-      client: storage,
+      client: provider.client,
       params: {
-        Bucket: bucket,
+        Bucket: provider.bucket,
         Key: outputKey,
         Body: createReadStream(outputPath),
         ContentLength: outputStat.size,
@@ -302,6 +307,7 @@ async function runConversion(jobId, key, filename) {
       size: outputStat.size,
       duration,
       passthrough: false,
+      storageProvider: provider.id,
       finishedAt: new Date().toISOString()
     });
     console.log('[Conversion ' + jobId + '] Completed:', outputKey);
@@ -328,13 +334,14 @@ app.post('/convert', (req, res) => {
 
   const key = typeof req.body?.key === 'string' ? req.body.key : '';
   const filename = safeFilename(req.body?.filename);
+  const providerId = typeof req.body?.storageProvider === 'string' ? req.body.storageProvider : 'filebase';
 
   if (!key || key.startsWith('/') || key.split('/').includes('..')) {
     return res.status(400).json({ error: 'Invalid source key.' });
   }
 
   try {
-    assertConfigured();
+    assertConfigured(providerId);
   } catch (error) {
     return res.status(503).json({ error: error.message });
   }
@@ -347,7 +354,7 @@ app.post('/convert', (req, res) => {
   });
   conversionRunning = true;
   console.log('[Conversion ' + jobId + '] Job accepted');
-  runConversion(jobId, key, filename);
+  runConversion(jobId, key, filename, providerId);
   res.status(202).json({ jobId, status: 'processing' });
 });
 
